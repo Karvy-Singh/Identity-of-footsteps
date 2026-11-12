@@ -4,68 +4,69 @@
 #include <array>
 #include <stdint.h>
 
-// ===================================
-// RECORDING SETTINGS
-// ===================================
-
-constexpr int CAPTURE_SECONDS = 2;
-
-constexpr int MIC_RATE = 4000;
-constexpr int PIEZO_RATE = 1000;
+// Recording configuration
+constexpr int CAPTURE_SECONDS = 15;
+constexpr int ANALOG_RATE = 500;
 constexpr int MPU_RATE = 200;
 
-constexpr uint32_t MIC_US = 250;
-constexpr uint32_t PIEZO_US = 1000;
-constexpr uint32_t MPU_US = 5000;
-
-constexpr uint32_t DURATION_US =
+constexpr uint32_t CAPTURE_US =
     CAPTURE_SECONDS * 1000000UL;
 
-constexpr int MIC_N = MIC_RATE * CAPTURE_SECONDS;
-constexpr int PIEZO_N = PIEZO_RATE * CAPTURE_SECONDS;
-constexpr int MPU_N = MPU_RATE * CAPTURE_SECONDS;
+constexpr uint32_t ANALOG_PERIOD_US =
+    1000000UL / ANALOG_RATE;
+
+constexpr uint32_t MPU_PERIOD_US =
+    1000000UL / MPU_RATE;
+
+constexpr int ANALOG_MAX =
+    CAPTURE_SECONDS * ANALOG_RATE;
+
+constexpr int MPU_MAX =
+    CAPTURE_SECONDS * MPU_RATE;
 
 constexpr int16_t MISSING = -32768;
+
 constexpr uint8_t MPU_ADDR = 0x68;
+constexpr int MIC_PIN = A0;
+constexpr int PIEZO_PIN = A1;
 
-// ===================================
-// SENSOR DATA ARRAYS
-// ===================================
+// Actual timestamps and readings
+uint32_t micTimes[ANALOG_MAX];
+uint32_t piezoTimes[ANALOG_MAX];
 
-int16_t micData[MIC_N];
-int16_t piezoData[PIEZO_N];
+int16_t micValues[ANALOG_MAX];
+int16_t piezoValues[ANALOG_MAX];
 
-int16_t mpuX[MPU_N];
-int16_t mpuY[MPU_N];
-int16_t mpuZ[MPU_N];
+uint32_t mpuTimes[MPU_MAX];
+int16_t mpuX[MPU_MAX];
+int16_t mpuY[MPU_MAX];
+int16_t mpuZ[MPU_MAX];
 
-// ===================================
-// STATE
-// ===================================
-
-bool startRequested = false;
-bool sensorReady = false;
+// Recording state
+volatile bool startRequested = false;
+volatile int captureState = 0;
 
 // 0 = idle
 // 1 = recording
 // 2 = finished
 
-int captureState = 0;
-
-int micCount = 0;
-int piezoCount = 0;
+int analogCount = 0;
 int mpuCount = 0;
 
-uint32_t missedMic = 0;
-uint32_t missedPiezo = 0;
+uint32_t missedAnalog = 0;
 uint32_t missedMPU = 0;
 uint32_t mpuErrors = 0;
+uint32_t adcErrors = 0;
+
+bool mpuReady = false;
 
 uint32_t captureStartUs = 0;
+uint32_t nextAnalogUs = 0;
+uint32_t nextMPUUs = 0;
 
-// ===================================
+// -----------------------------
 // MPU6050 FUNCTIONS
-// ===================================
+// -----------------------------
 
 bool writeRegister(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(MPU_ADDR);
@@ -75,11 +76,11 @@ bool writeRegister(uint8_t reg, uint8_t value) {
   return Wire.endTransmission(true) == 0;
 }
 
-bool readMPU(int16_t &ax, int16_t &ay, int16_t &az) {
+bool readMPU(int16_t &x, int16_t &y, int16_t &z) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
 
-  // Method that worked on your UNO Q
+  // Working method for your UNO Q
   if (Wire.endTransmission(true) != 0) {
     return false;
   }
@@ -95,171 +96,153 @@ bool readMPU(int16_t &ax, int16_t &ay, int16_t &az) {
     d[i] = Wire.read();
   }
 
-  ax = (int16_t)(((uint16_t)d[0] << 8) | d[1]);
-  ay = (int16_t)(((uint16_t)d[2] << 8) | d[3]);
-  az = (int16_t)(((uint16_t)d[4] << 8) | d[5]);
+  x = (int16_t)(((uint16_t)d[0] << 8) | d[1]);
+  y = (int16_t)(((uint16_t)d[2] << 8) | d[3]);
+  z = (int16_t)(((uint16_t)d[4] << 8) | d[5]);
 
   return true;
 }
 
 bool initializeMPU() {
-  if (!writeRegister(0x6B, 0x00)) return false;
+  if (!writeRegister(0x6B, 0x00))
+    return false;
 
   delay(100);
 
-  // Accelerometer +/- 2g
-  if (!writeRegister(0x1C, 0x00)) return false;
+  // Accelerometer +/-2g
+  if (!writeRegister(0x1C, 0x00))
+    return false;
 
-  // Low-pass filter
-  if (!writeRegister(0x1A, 0x03)) return false;
+  // Digital low-pass filter
+  if (!writeRegister(0x1A, 0x03))
+    return false;
 
-  // MPU6050 internal 200 Hz sampling
-  if (!writeRegister(0x19, 0x04)) return false;
+  // 200 Hz internal output
+  if (!writeRegister(0x19, 0x04))
+    return false;
 
-  int16_t ax, ay, az;
-  return readMPU(ax, ay, az);
+  int16_t x, y, z;
+  return readMPU(x, y, z);
 }
 
-// ===================================
-// BRIDGE FUNCTION
-// ===================================
+// -----------------------------
+// BRIDGE COMMUNICATION
+// -----------------------------
+// cmd 0: status
+// cmd 1: start recording
+// cmd 2: mic + piezo data
+// cmd 3: MPU6050 data
+//
+// Each response contains 25 integers.
+// Download only after recording.
 
-// cmd = 0 : get status
-// cmd = 1 : start recording
-// cmd = 2 : microphone data
-// cmd = 3 : piezo data
-// cmd = 4 : MPU data
-
-std::array<int32_t, 41> footstepRPC(
+std::array<int32_t, 25> footstepRPC(
     int cmd, int start) {
 
-  std::array<int32_t, 41> result = {};
+  std::array<int32_t, 25> out = {};
 
-  // STATUS
   if (cmd == 0) {
-    result[0] = captureState;
-    result[1] = micCount;
-    result[2] = piezoCount;
-    result[3] = mpuCount;
-    result[4] = missedMic;
-    result[5] = missedPiezo;
-    result[6] = missedMPU;
-    result[7] = mpuErrors;
-    result[8] = sensorReady ? 1 : 0;
-    result[9] = CAPTURE_SECONDS;
-
-    return result;
+    out[0] = captureState;
+    out[1] = analogCount;
+    out[2] = mpuCount;
+    out[3] = missedAnalog;
+    out[4] = missedMPU;
+    out[5] = mpuErrors;
+    out[6] = adcErrors;
+    out[7] = mpuReady ? 1 : 0;
+    out[8] = CAPTURE_SECONDS;
+    out[9] = ANALOG_RATE;
+    out[10] = MPU_RATE;
+    return out;
   }
 
-  // START
   if (cmd == 1) {
     if (captureState != 1 && !startRequested) {
       startRequested = true;
-      result[0] = 1;
+      out[0] = 1;
     }
-
-    return result;
+    return out;
   }
 
-  // Downloads only after recording
   if (captureState != 2 || start < 0) {
-    return result;
+    return out;
   }
 
-  // MICROPHONE / PIEZO
-  if (cmd == 2 || cmd == 3) {
-    int total = (cmd == 2) ? micCount : piezoCount;
+  // Mic and piezo: 6 pairs per response
+  // timeMic, mic, timePiezo, piezo
+  if (cmd == 2) {
+    if (start >= analogCount) return out;
 
-    if (start >= total) return result;
+    int count = analogCount - start;
+    if (count > 6) count = 6;
 
-    int count = total - start;
-    if (count > 40) count = 40;
-
-    result[0] = count;
+    out[0] = count;
 
     for (int i = 0; i < count; i++) {
-      result[i + 1] = (cmd == 2)
-        ? micData[start + i]
-        : piezoData[start + i];
+      int j = 1 + 4 * i;
+      int n = start + i;
+
+      out[j] = micTimes[n];
+      out[j + 1] = micValues[n];
+      out[j + 2] = piezoTimes[n];
+      out[j + 3] = piezoValues[n];
     }
 
-    return result;
+    return out;
   }
 
-  // MPU6050: 10 XYZ readings per block
-  if (cmd == 4) {
-    if (start >= mpuCount) return result;
+  // MPU6050: 6 frames per response
+  // time, X, Y, Z
+  if (cmd == 3) {
+    if (start >= mpuCount) return out;
 
-    int frames = mpuCount - start;
-    if (frames > 10) frames = 10;
+    int count = mpuCount - start;
+    if (count > 6) count = 6;
 
-    result[0] = frames;
+    out[0] = count;
 
-    for (int i = 0; i < frames; i++) {
-      int j = 1 + i * 3;
+    for (int i = 0; i < count; i++) {
+      int j = 1 + 4 * i;
+      int n = start + i;
 
-      result[j] = mpuX[start + i];
-      result[j + 1] = mpuY[start + i];
-      result[j + 2] = mpuZ[start + i];
+      out[j] = mpuTimes[n];
+      out[j + 1] = mpuX[n];
+      out[j + 2] = mpuY[n];
+      out[j + 3] = mpuZ[n];
     }
   }
 
-  return result;
+  return out;
 }
 
-// ===================================
-// START CAPTURE
-// ===================================
+// -----------------------------
+// START RECORDING
+// -----------------------------
 
 void beginCapture() {
   startRequested = false;
   captureState = 0;
 
-  micCount = 0;
-  piezoCount = 0;
+  analogCount = 0;
   mpuCount = 0;
 
-  missedMic = 0;
-  missedPiezo = 0;
+  missedAnalog = 0;
   missedMPU = 0;
   mpuErrors = 0;
+  adcErrors = 0;
 
-  sensorReady = initializeMPU();
+  mpuReady = initializeMPU();
 
   captureStartUs = micros();
+  nextAnalogUs = 0;
+  nextMPUUs = 0;
+
   captureState = 1;
 }
 
-// ===================================
-// FINISH CAPTURE
-// ===================================
-
-void finishCapture() {
-  while (micCount < MIC_N) {
-    micData[micCount++] = MISSING;
-    missedMic++;
-  }
-
-  while (piezoCount < PIEZO_N) {
-    piezoData[piezoCount++] = MISSING;
-    missedPiezo++;
-  }
-
-  while (mpuCount < MPU_N) {
-    mpuX[mpuCount] = MISSING;
-    mpuY[mpuCount] = MISSING;
-    mpuZ[mpuCount] = MISSING;
-
-    mpuCount++;
-    missedMPU++;
-  }
-
-  captureState = 2;
-}
-
-// ===================================
+// -----------------------------
 // SETUP
-// ===================================
+// -----------------------------
 
 void setup() {
   Bridge.begin();
@@ -267,90 +250,123 @@ void setup() {
 
   analogReadResolution(14);
 
-  // Only one Bridge function
-  Bridge.provide_safe("footstep_rpc", footstepRPC);
+  Bridge.provide_safe(
+    "footstep_rpc", footstepRPC
+  );
 }
 
-// ===================================
+// -----------------------------
 // MAIN LOOP
-// ===================================
+// -----------------------------
 
 void loop() {
-
   if (startRequested && captureState != 1) {
     beginCapture();
   }
 
   if (captureState != 1) {
+    delay(1);
     return;
   }
 
   uint32_t elapsed =
       (uint32_t)(micros() - captureStartUs);
 
-  if (elapsed >= DURATION_US) {
-    finishCapture();
+  if (elapsed >= CAPTURE_US) {
+    captureState = 2;
     return;
   }
 
-  // MICROPHONE 4000 Hz
-  uint32_t micSlot = elapsed / MIC_US;
+  // ---------------------------
+  // MPU6050: target 200 Hz
+  // ---------------------------
 
-  if (micSlot >= (uint32_t)micCount &&
-      micCount < MIC_N) {
+  if (elapsed >= nextMPUUs) {
+    if (mpuCount < MPU_MAX) {
+      uint32_t t = micros() - captureStartUs;
 
-    while ((uint32_t)micCount < micSlot) {
-      micData[micCount++] = MISSING;
-      missedMic++;
-    }
+      int16_t x, y, z;
 
-    micData[micCount++] =
-        (int16_t)analogRead(A0);
-  }
+      mpuTimes[mpuCount] = t;
 
-  // PIEZO 1000 Hz
-  uint32_t piezoSlot = elapsed / PIEZO_US;
-
-  if (piezoSlot >= (uint32_t)piezoCount &&
-      piezoCount < PIEZO_N) {
-
-    while ((uint32_t)piezoCount < piezoSlot) {
-      piezoData[piezoCount++] = MISSING;
-      missedPiezo++;
-    }
-
-    piezoData[piezoCount++] =
-        (int16_t)analogRead(A2);
-  }
-
-  // MPU6050 200 Hz
-  uint32_t mpuSlot = elapsed / MPU_US;
-
-  if (mpuSlot >= (uint32_t)mpuCount &&
-      mpuCount < MPU_N) {
-
-    while ((uint32_t)mpuCount < mpuSlot) {
-      mpuX[mpuCount] = MISSING;
-      mpuY[mpuCount] = MISSING;
-      mpuZ[mpuCount] = MISSING;
+      if (mpuReady && readMPU(x, y, z)) {
+        mpuX[mpuCount] = x;
+        mpuY[mpuCount] = y;
+        mpuZ[mpuCount] = z;
+      } else {
+        mpuX[mpuCount] = MISSING;
+        mpuY[mpuCount] = MISSING;
+        mpuZ[mpuCount] = MISSING;
+        mpuErrors++;
+      }
 
       mpuCount++;
-      missedMPU++;
     }
 
-    int16_t ax, ay, az;
+    nextMPUUs += MPU_PERIOD_US;
 
-    if (sensorReady && readMPU(ax, ay, az)) {
-      mpuX[mpuCount] = ax;
-      mpuY[mpuCount] = ay;
-      mpuZ[mpuCount] = az;
-    } else {
-      mpuX[mpuCount] = MISSING;
-      mpuY[mpuCount] = MISSING;
-      mpuZ[mpuCount] = MISSING;
-      mpuErrors++;
+    uint32_t after = micros() - captureStartUs;
+
+    if (after >= nextMPUUs) {
+      uint32_t skipped =
+          (after - nextMPUUs) / MPU_PERIOD_US + 1;
+
+      missedMPU += skipped;
+      nextMPUUs += skipped * MPU_PERIOD_US;
+    }
+  }
+
+  // ---------------------------
+  // MIC AND PIEZO: target 500 Hz
+  // ---------------------------
+
+  elapsed = micros() - captureStartUs;
+
+  if (elapsed < CAPTURE_US &&
+      elapsed >= nextAnalogUs) {
+
+    if (analogCount < ANALOG_MAX) {
+      uint32_t tMic =
+          micros() - captureStartUs;
+
+      int mic = analogRead(MIC_PIN);
+
+      uint32_t tPiezo =
+          micros() - captureStartUs;
+
+      int piezo = analogRead(PIEZO_PIN);
+
+      micTimes[analogCount] = tMic;
+      piezoTimes[analogCount] = tPiezo;
+
+      if (mic >= 0 && mic <= 16383) {
+        micValues[analogCount] = mic;
+      } else {
+        micValues[analogCount] = MISSING;
+        adcErrors++;
+      }
+
+      if (piezo >= 0 && piezo <= 16383) {
+        piezoValues[analogCount] = piezo;
+      } else {
+        piezoValues[analogCount] = MISSING;
+        adcErrors++;
+      }
+
+      analogCount++;
     }
 
-    mpuCount++;
+    nextAnalogUs += ANALOG_PERIOD_US;
+
+    uint32_t after = micros() - captureStartUs;
+
+    if (after >= nextAnalogUs) {
+      uint32_t skipped =
+          (after - nextAnalogUs) /
+          ANALOG_PERIOD_US + 1;
+
+      missedAnalog += skipped;
+      nextAnalogUs += skipped * ANALOG_PERIOD_US;
+    }
   }
 }
