@@ -1,372 +1,211 @@
+// Arduino UNO Q — continuous three-sensor acquisition for live ML.
+// SEN0487 microphone A0, protected/bias-conditioned piezo A1,
+// MPU6050 SDA/SCL (0x68). Readings are streamed in Bridge batches.
+// Nominal rates match the previously trained Harsh/Karvy model:
+//   microphone 500 Hz; piezo 500 Hz; MPU6050 200 Hz.
+// Sampling is best-effort, NOT hardware-timer/DMA guaranteed.
 
 #include <Wire.h>
 #include <Arduino_RouterBridge.h>
 #include <array>
 #include <stdint.h>
 
-// Recording configuration
-constexpr int CAPTURE_SECONDS = 15;
-constexpr int ANALOG_RATE = 500;
-constexpr int MPU_RATE = 200;
-
-constexpr uint32_t CAPTURE_US =
-    CAPTURE_SECONDS * 1000000UL;
-
-constexpr uint32_t ANALOG_PERIOD_US =
-    1000000UL / ANALOG_RATE;
-
-constexpr uint32_t MPU_PERIOD_US =
-    1000000UL / MPU_RATE;
-
-constexpr int ANALOG_MAX =
-    CAPTURE_SECONDS * ANALOG_RATE;
-
-constexpr int MPU_MAX =
-    CAPTURE_SECONDS * MPU_RATE;
-
-constexpr int16_t MISSING = -32768;
-
-constexpr uint8_t MPU_ADDR = 0x68;
 constexpr int MIC_PIN = A0;
 constexpr int PIEZO_PIN = A1;
+constexpr uint8_t MPU_ADDR = 0x68;
+constexpr uint32_t ANALOG_PERIOD_US = 2000;  // 500 Hz
+constexpr uint32_t MPU_PERIOD_US = 5000;     // 200 Hz
+constexpr uint32_t ANALOG_RATE = 500;
+constexpr uint32_t MPU_RATE = 200;
+constexpr uint32_t RING_SECONDS = 8;
+constexpr uint32_t ANALOG_RING = ANALOG_RATE * RING_SECONDS;
+constexpr uint32_t MPU_RING = MPU_RATE * RING_SECONDS;
+constexpr int16_t MISSING = -32768;
 
-// Actual timestamps and readings
-uint32_t micTimes[ANALOG_MAX];
-uint32_t piezoTimes[ANALOG_MAX];
+// 25.6 kB of buffers, continually reused (no 15-second memory cap).
+int16_t micRing[ANALOG_RING];
+int16_t piezoRing[ANALOG_RING];
+int16_t xRing[MPU_RING];
+int16_t yRing[MPU_RING];
+int16_t zRing[MPU_RING];
 
-int16_t micValues[ANALOG_MAX];
-int16_t piezoValues[ANALOG_MAX];
-
-uint32_t mpuTimes[MPU_MAX];
-int16_t mpuX[MPU_MAX];
-int16_t mpuY[MPU_MAX];
-int16_t mpuZ[MPU_MAX];
-
-// Recording state
-volatile bool startRequested = false;
-volatile int captureState = 0;
-
-// 0 = idle
-// 1 = recording
-// 2 = finished
-
-int analogCount = 0;
-int mpuCount = 0;
-
+uint32_t nextAnalogDue = 0;
+uint32_t nextMpuDue = 0;
+uint32_t analogProduced = 0; // absolute sample slots since startup
+uint32_t mpuProduced = 0;
 uint32_t missedAnalog = 0;
-uint32_t missedMPU = 0;
+uint32_t missedMpu = 0;
 uint32_t mpuErrors = 0;
-uint32_t adcErrors = 0;
-
 bool mpuReady = false;
-
-uint32_t captureStartUs = 0;
-uint32_t nextAnalogUs = 0;
-uint32_t nextMPUUs = 0;
-
-// -----------------------------
-// MPU6050 FUNCTIONS
-// -----------------------------
 
 bool writeRegister(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(reg);
   Wire.write(value);
-
   return Wire.endTransmission(true) == 0;
 }
 
 bool readMPU(int16_t &x, int16_t &y, int16_t &z) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
-
-  // Working method for your UNO Q
-  if (Wire.endTransmission(true) != 0) {
-    return false;
-  }
-
-  if (Wire.requestFrom(
-      MPU_ADDR, (size_t)6, true) != 6) {
-    return false;
-  }
-
+  if (Wire.endTransmission(true) != 0) return false;
+  if (Wire.requestFrom(MPU_ADDR, (size_t)6, true) != 6) return false;
   uint8_t d[6];
-
-  for (int i = 0; i < 6; i++) {
-    d[i] = Wire.read();
-  }
-
+  for (int i = 0; i < 6; ++i) d[i] = Wire.read();
   x = (int16_t)(((uint16_t)d[0] << 8) | d[1]);
   y = (int16_t)(((uint16_t)d[2] << 8) | d[3]);
   z = (int16_t)(((uint16_t)d[4] << 8) | d[5]);
-
   return true;
 }
 
 bool initializeMPU() {
-  if (!writeRegister(0x6B, 0x00))
-    return false;
-
+  if (!writeRegister(0x6B, 0x00)) return false;
   delay(100);
-
-  // Accelerometer +/-2g
-  if (!writeRegister(0x1C, 0x00))
-    return false;
-
-  // Digital low-pass filter
-  if (!writeRegister(0x1A, 0x03))
-    return false;
-
-  // 200 Hz internal output
-  if (!writeRegister(0x19, 0x04))
-    return false;
-
+  if (!writeRegister(0x1C, 0x00)) return false; // +/- 2g
+  if (!writeRegister(0x1A, 0x03)) return false; // DLPF
+  if (!writeRegister(0x19, 0x04)) return false; // 200 Hz output
   int16_t x, y, z;
   return readMPU(x, y, z);
 }
 
-// -----------------------------
-// BRIDGE COMMUNICATION
-// -----------------------------
+// The 16-bit signed encoding uses -32768 for a missing deadline.
+void writeAnalog(int16_t mic, int16_t piezo) {
+  uint32_t k = analogProduced % ANALOG_RING;
+  micRing[k] = mic;
+  piezoRing[k] = piezo;
+  ++analogProduced;
+}
+
+void writeMpu(int16_t x, int16_t y, int16_t z) {
+  uint32_t k = mpuProduced % MPU_RING;
+  xRing[k] = x;
+  yRing[k] = y;
+  zRing[k] = z;
+  ++mpuProduced;
+}
+
+// A single RPC method was already validated on your UNO Q.
 // cmd 0: status
-// cmd 1: start recording
-// cmd 2: mic + piezo data
-// cmd 3: MPU6050 data
-//
-// Each response contains 25 integers.
-// Download only after recording.
-
-std::array<int32_t, 25> footstepRPC(
-    int cmd, int start) {
-
-  std::array<int32_t, 25> out = {};
+// cmd 2: up to 40 analog pairs, mic packed in upper 16 bits,
+//        piezo in lower 16 bits (both signed 16-bit).
+// cmd 3: up to 13 MPU frames, with three signed values per frame.
+// start: absolute sequence index, not a ring-array offset.
+// out[0]: count, 0=no data yet, -2=buffer overrun, -1=bad request.
+std::array<int32_t, 41> liveRPC(int cmd, int start) {
+  std::array<int32_t, 41> out = {};
 
   if (cmd == 0) {
-    out[0] = captureState;
-    out[1] = analogCount;
-    out[2] = mpuCount;
-    out[3] = missedAnalog;
-    out[4] = missedMPU;
-    out[5] = mpuErrors;
-    out[6] = adcErrors;
-    out[7] = mpuReady ? 1 : 0;
-    out[8] = CAPTURE_SECONDS;
-    out[9] = ANALOG_RATE;
-    out[10] = MPU_RATE;
+    out[0] = 2026; // protocol marker
+    out[1] = (int32_t)analogProduced;
+    out[2] = (int32_t)mpuProduced;
+    out[3] = (int32_t)missedAnalog;
+    out[4] = (int32_t)missedMpu;
+    out[5] = (int32_t)mpuErrors;
+    out[6] = mpuReady ? 1 : 0;
+    out[7] = (int32_t)ANALOG_RATE;
+    out[8] = (int32_t)MPU_RATE;
+    out[9] = (int32_t)ANALOG_RING;
+    out[10] = (int32_t)MPU_RING;
     return out;
   }
 
-  if (cmd == 1) {
-    if (captureState != 1 && !startRequested) {
-      startRequested = true;
-      out[0] = 1;
-    }
+  if (start < 0) {
+    out[0] = -1;
     return out;
   }
 
-  if (captureState != 2 || start < 0) {
-    return out;
-  }
-
-  // Mic and piezo: 6 pairs per response
-  // timeMic, mic, timePiezo, piezo
   if (cmd == 2) {
-    if (start >= analogCount) return out;
-
-    int count = analogCount - start;
-    if (count > 6) count = 6;
-
-    out[0] = count;
-
-    for (int i = 0; i < count; i++) {
-      int j = 1 + 4 * i;
-      int n = start + i;
-
-      out[j] = micTimes[n];
-      out[j + 1] = micValues[n];
-      out[j + 2] = piezoTimes[n];
-      out[j + 3] = piezoValues[n];
+    uint32_t current = analogProduced;
+    uint32_t earliest = current > ANALOG_RING ? current - ANALOG_RING : 0;
+    uint32_t wanted = (uint32_t)start;
+    if (wanted < earliest) {
+      out[0] = -2;
+      out[1] = (int32_t)earliest;
+      out[2] = (int32_t)current;
+      return out;
     }
-
+    uint32_t count = wanted >= current ? 0 : current - wanted;
+    if (count > 40) count = 40;
+    out[0] = (int32_t)count;
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t k = (wanted + i) % ANALOG_RING;
+      uint32_t packed =
+          (uint32_t(uint16_t(micRing[k])) << 16) |
+          uint32_t(uint16_t(piezoRing[k]));
+      out[1 + i] = (int32_t)packed;
+    }
     return out;
   }
 
-  // MPU6050: 6 frames per response
-  // time, X, Y, Z
   if (cmd == 3) {
-    if (start >= mpuCount) return out;
-
-    int count = mpuCount - start;
-    if (count > 6) count = 6;
-
-    out[0] = count;
-
-    for (int i = 0; i < count; i++) {
-      int j = 1 + 4 * i;
-      int n = start + i;
-
-      out[j] = mpuTimes[n];
-      out[j + 1] = mpuX[n];
-      out[j + 2] = mpuY[n];
-      out[j + 3] = mpuZ[n];
+    uint32_t current = mpuProduced;
+    uint32_t earliest = current > MPU_RING ? current - MPU_RING : 0;
+    uint32_t wanted = (uint32_t)start;
+    if (wanted < earliest) {
+      out[0] = -2;
+      out[1] = (int32_t)earliest;
+      out[2] = (int32_t)current;
+      return out;
     }
+    uint32_t count = wanted >= current ? 0 : current - wanted;
+    if (count > 13) count = 13;
+    out[0] = (int32_t)count;
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t k = (wanted + i) % MPU_RING;
+      uint32_t j = 1 + 3 * i;
+      out[j] = xRing[k];
+      out[j + 1] = yRing[k];
+      out[j + 2] = zRing[k];
+    }
+    return out;
   }
 
+  out[0] = -1;
   return out;
 }
-
-// -----------------------------
-// START RECORDING
-// -----------------------------
-
-void beginCapture() {
-  startRequested = false;
-  captureState = 0;
-
-  analogCount = 0;
-  mpuCount = 0;
-
-  missedAnalog = 0;
-  missedMPU = 0;
-  mpuErrors = 0;
-  adcErrors = 0;
-
-  mpuReady = initializeMPU();
-
-  captureStartUs = micros();
-  nextAnalogUs = 0;
-  nextMPUUs = 0;
-
-  captureState = 1;
-}
-
-// -----------------------------
-// SETUP
-// -----------------------------
 
 void setup() {
   Bridge.begin();
   Wire.begin();
-
   analogReadResolution(14);
-
-  Bridge.provide_safe(
-    "footstep_rpc", footstepRPC
-  );
+  mpuReady = initializeMPU();
+  Bridge.provide_safe("footstep_live_rpc", liveRPC);
+  nextAnalogDue = micros();
+  nextMpuDue = nextAnalogDue;
 }
 
-// -----------------------------
-// MAIN LOOP
-// -----------------------------
-
 void loop() {
-  if (startRequested && captureState != 1) {
-    beginCapture();
-  }
-
-  if (captureState != 1) {
-    delay(1);
-    return;
-  }
-
-  uint32_t elapsed =
-      (uint32_t)(micros() - captureStartUs);
-
-  if (elapsed >= CAPTURE_US) {
-    captureState = 2;
-    return;
-  }
-
-  // ---------------------------
-  // MPU6050: target 200 Hz
-  // ---------------------------
-
-  if (elapsed >= nextMPUUs) {
-    if (mpuCount < MPU_MAX) {
-      uint32_t t = micros() - captureStartUs;
-
-      int16_t x, y, z;
-
-      mpuTimes[mpuCount] = t;
-
-      if (mpuReady && readMPU(x, y, z)) {
-        mpuX[mpuCount] = x;
-        mpuY[mpuCount] = y;
-        mpuZ[mpuCount] = z;
-      } else {
-        mpuX[mpuCount] = MISSING;
-        mpuY[mpuCount] = MISSING;
-        mpuZ[mpuCount] = MISSING;
-        mpuErrors++;
-      }
-
-      mpuCount++;
+  // micros() wraparound-safe clock comparison (provided lag < 35 min).
+  uint32_t now = micros();
+  int32_t analogLag = (int32_t)(now - nextAnalogDue);
+  if (analogLag >= 0) {
+    uint32_t missed = uint32_t(analogLag) / ANALOG_PERIOD_US;
+    // Advance the scheduler; missed deadlines remain visible as MISSING.
+    for (uint32_t i = 0; i < missed; ++i) {
+      writeAnalog(MISSING, MISSING);
     }
-
-    nextMPUUs += MPU_PERIOD_US;
-
-    uint32_t after = micros() - captureStartUs;
-
-    if (after >= nextMPUUs) {
-      uint32_t skipped =
-          (after - nextMPUUs) / MPU_PERIOD_US + 1;
-
-      missedMPU += skipped;
-      nextMPUUs += skipped * MPU_PERIOD_US;
-    }
+    missedAnalog += missed;
+    nextAnalogDue += (missed + 1) * ANALOG_PERIOD_US;
+    int mic = analogRead(MIC_PIN);
+    int piezo = analogRead(PIEZO_PIN);
+    writeAnalog((int16_t)mic, (int16_t)piezo);
   }
 
-  // ---------------------------
-  // MIC AND PIEZO: target 500 Hz
-  // ---------------------------
-
-  elapsed = micros() - captureStartUs;
-
-  if (elapsed < CAPTURE_US &&
-      elapsed >= nextAnalogUs) {
-
-    if (analogCount < ANALOG_MAX) {
-      uint32_t tMic =
-          micros() - captureStartUs;
-
-      int mic = analogRead(MIC_PIN);
-
-      uint32_t tPiezo =
-          micros() - captureStartUs;
-
-      int piezo = analogRead(PIEZO_PIN);
-
-      micTimes[analogCount] = tMic;
-      piezoTimes[analogCount] = tPiezo;
-
-      if (mic >= 0 && mic <= 16383) {
-        micValues[analogCount] = mic;
-      } else {
-        micValues[analogCount] = MISSING;
-        adcErrors++;
-      }
-
-      if (piezo >= 0 && piezo <= 16383) {
-        piezoValues[analogCount] = piezo;
-      } else {
-        piezoValues[analogCount] = MISSING;
-        adcErrors++;
-      }
-
-      analogCount++;
+  now = micros();
+  int32_t mpuLag = (int32_t)(now - nextMpuDue);
+  if (mpuLag >= 0) {
+    uint32_t missed = uint32_t(mpuLag) / MPU_PERIOD_US;
+    for (uint32_t i = 0; i < missed; ++i) {
+      writeMpu(MISSING, MISSING, MISSING);
     }
-
-    nextAnalogUs += ANALOG_PERIOD_US;
-
-    uint32_t after = micros() - captureStartUs;
-
-    if (after >= nextAnalogUs) {
-      uint32_t skipped =
-          (after - nextAnalogUs) /
-          ANALOG_PERIOD_US + 1;
-
-      missedAnalog += skipped;
-      nextAnalogUs += skipped * ANALOG_PERIOD_US;
+    missedMpu += missed;
+    nextMpuDue += (missed + 1) * MPU_PERIOD_US;
+    int16_t x, y, z;
+    if (mpuReady && readMPU(x, y, z)) {
+      writeMpu(x, y, z);
+    } else {
+      writeMpu(MISSING, MISSING, MISSING);
+      ++mpuErrors;
     }
   }
 }
