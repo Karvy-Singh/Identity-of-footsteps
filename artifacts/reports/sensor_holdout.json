@@ -1,0 +1,177 @@
+{
+  "sessions_per_class": {
+    "Karvy": 4,
+    "Harsh": 4,
+    "Rudra": 8,
+    "No Footsteps": 6
+  },
+  "held_out_sessions": {
+    "Harsh": "footstep_dataset/harsh/trial_001_20261113_104712",
+    "Karvy": "footstep_dataset/KARVY/trial_001_20261113_075828",
+    "Rudra": "footstep_dataset/rudra/trial_001_20261113_063439",
+    "No Footsteps": "footstep_dataset/silent/trial_001_20261113_060022"
+  },
+  "models": {
+    "microphone": {
+      "training_windows": 252,
+      "held_out_windows": 56,
+      "held_out_window_accuracy": 0.9643,
+      "held_out_session_accuracy": 1.0,
+      "held_out_confusion_matrix": [
+        [
+          13,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          14,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          13,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          14
+        ]
+      ],
+      "held_out_session_predictions": {
+        "footstep_dataset/KARVY/trial_001_20261113_075828": {
+          "actual": "Karvy",
+          "predicted": "Karvy",
+          "windows": 14
+        },
+        "footstep_dataset/harsh/trial_001_20261113_104712": {
+          "actual": "Harsh",
+          "predicted": "Harsh",
+          "windows": 14
+        },
+        "footstep_dataset/rudra/trial_001_20261113_063439": {
+          "actual": "Rudra",
+          "predicted": "Rudra",
+          "windows": 14
+        },
+        "footstep_dataset/silent/trial_001_20261113_060022": {
+          "actual": "No Footsteps",
+          "predicted": "No Footsteps",
+          "windows": 14
+        }
+      },
+      "empty_or_short_trials": 0
+    },
+    "piezo": {
+      "training_windows": 252,
+      "held_out_windows": 56,
+      "held_out_window_accuracy": 0.9643,
+      "held_out_session_accuracy": 1.0,
+      "held_out_confusion_matrix": [
+        [
+          12,
+          1,
+          1,
+          0
+        ],
+        [
+          0,
+          14,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          14,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          14
+        ]
+      ],
+      "held_out_session_predictions": {
+        "footstep_dataset/KARVY/trial_001_20261113_075828": {
+          "actual": "Karvy",
+          "predicted": "Karvy",
+          "windows": 14
+        },
+        "footstep_dataset/harsh/trial_001_20261113_104712": {
+          "actual": "Harsh",
+          "predicted": "Harsh",
+          "windows": 14
+        },
+        "footstep_dataset/rudra/trial_001_20261113_063439": {
+          "actual": "Rudra",
+          "predicted": "Rudra",
+          "windows": 14
+        },
+        "footstep_dataset/silent/trial_001_20261113_060022": {
+          "actual": "No Footsteps",
+          "predicted": "No Footsteps",
+          "windows": 14
+        }
+      },
+      "empty_or_short_trials": 0
+    },
+    "mpu6050": {
+      "training_windows": 177,
+      "held_out_windows": 41,
+      "held_out_window_accuracy": 0.9024,
+      "held_out_session_accuracy": 1.0,
+      "held_out_confusion_matrix": [
+        [
+          11,
+          0,
+          3,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          14,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          12
+        ]
+      ],
+      "held_out_session_predictions": {
+        "footstep_dataset/harsh/trial_001_20261113_104712": {
+          "actual": "Harsh",
+          "predicted": "Harsh",
+          "windows": 14
+        },
+        "footstep_dataset/rudra/trial_001_20261113_063439": {
+          "actual": "Rudra",
+          "predicted": "Rudra",
+          "windows": 14
+        },
+        "footstep_dataset/silent/trial_001_20261113_060022": {
+          "actual": "No Footsteps",
+          "predicted": "No Footsteps",
+          "windows": 13
+        }
+      },
+      "empty_or_short_trials": 2
+    }
+  },
+  "warning": "Only one session per class held out. Collect more unseen days and surfaces."
+}

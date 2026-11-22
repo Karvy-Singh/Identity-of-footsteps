@@ -1,0 +1,3 @@
+# Install this on your strong PC only when using PANNs CNN14 embeddings.
+torch>=2.1
+torchlibrosa>=0.1.0
