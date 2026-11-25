@@ -2,6 +2,10 @@
 
 Controlled footstep identification using low-cost acoustic, vibration, and motion sensors.
 
+Inspired by the recent study published in the journal Sensors (Volume 26, Issue 18, Article 5736, September 2026): 
+
+https://www.mdpi.com/1424-8220/26/18/5736
+
 ## System
 - **Hardware:** Arduino UNO Q, SEN0487 microphone on A0, conditioned piezo sensor on A1, and MPU6050 over I2C (`0x68`).
 - **Pass 1:** 10 s audio-only WAV capture at a nominal 6 kHz.
